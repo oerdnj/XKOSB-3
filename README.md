@@ -24,7 +24,7 @@ The build system is meson, so build is done by running:
 First run a server, then run a client; client will first download the p, g and
 then the server and client will exchange their public keys, calculate shared
 secret.  The shared secret is then fed to hash function to generate 32-bytes key
-used to as key to establish symetric XChaCha2-Poly1305 encryption between the
+used to as key to establish symmetric XChaCha2-Poly1305 encryption between the
 two endpoints.
 
 NOTE: Server can only talk to a single client at the time, but it will accept
@@ -58,7 +58,7 @@ The DHM key exchange is implemented using gmplib that provides large int
 arithmetics (including the exponentiation function modulo).  This is the DHM in
 its simplest form - there's no authentication of the parties.
 
-The symetric key encryption is implemented using libsodium's XChaCha20-Poly1305
+The symmetric key encryption is implemented using libsodium's XChaCha20-Poly1305
 stream cipher. The code calls abort() on any crypto failure, which is not
 exactly user friendly.  The library has support for 'additional data' that can
 be included in the computation of the authentication tag.  I think this could be

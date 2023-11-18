@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <uv.h>
 
 #define DEFAULT_BACKLOG 10
@@ -16,8 +17,12 @@
 #define PRIME_BITS	   128
 #define PROBAB_PRIME_ITERS 50
 
-/* _Static_assert(crypto_generichash_BYTES == crypto_secretstream_xchacha20poly1305_KEYBYTES, "crypto_generichash_BYTES
- * differs from crypto_secretstream_xchacha20poly1305_KEYBYTES, you need to use different KDF); */
+#if __linux__
+
+#define ntohll(big_endian_64bits) be64toh(big_endian_64bits)
+#define htonll(host_64bits)	  htobe64(host_64bits)
+
+#endif
 
 /* Type-casting helpers */
 
@@ -48,6 +53,7 @@ typedef struct state {
 		mpz_t secret;
 	};
 
+	bool tty_initialized;
 	uv_tty_t tty[2];
 
 	readstate_t rstate;
@@ -56,8 +62,8 @@ typedef struct state {
 			size_t len;
 			char base[2 * 65536];
 		};
-		char *data;
-	} read;
+		char buffer[(2 * 65536) + sizeof(size_t)];
+	} read_s;
 	size_t readlen;
 
 	union {
@@ -69,22 +75,39 @@ typedef struct state {
 		uint8_t key[crypto_secretstream_xchacha20poly1305_KEYBYTES];
 		uint8_t header[2][crypto_secretstream_xchacha20poly1305_HEADERBYTES];
 		crypto_secretstream_xchacha20poly1305_state state[2];
-	};
+	} stream;
 } state_t;
+
+state_t *
+state_new(void) {
+	state_t *state = calloc(1, sizeof(*state));
+
+	mpz_inits(state->p, state->g, state->private, state->public, state->secret, NULL);
+
+	return state;
+}
+
+void
+state_free(state_t *state) {
+	mpz_clears(state->p, state->g, state->private, state->public, state->secret, NULL);
+	free(state);
+}
 
 void
 state_close_cb(uv_handle_t *handle) {
 	state_t *state = uv_handle_get_data(handle);
 
-	free(state);
+	state_free(state);
 }
 
 void
 state_close(uv_stream_t *stream, state_t *state) {
 	/* This need to be in reverse order */
 	uv_close(stream, state_close_cb);
-	uv_close(&state->tty[1], NULL);
-	uv_close(&state->tty[0], NULL);
+	if (state->tty_initialized) {
+		uv_close(&state->tty[1], NULL);
+		uv_close(&state->tty[0], NULL);
+	}
 }
 
 typedef struct write {
@@ -117,6 +140,9 @@ write_free(write_t *write) {
 	if (write->wbuf[1].base != NULL) {
 		free(write->wbuf[1].base);
 	}
+	if (write->wbuf[0].base != (char *)&write->wlen) {
+		free(write->wbuf[0].base);
+	}
 	free(write);
 }
 
@@ -137,80 +163,170 @@ static inline void
 mpz_urandomm1(mpz_t rop, gmp_randstate_t randstate, const mpz_t n);
 
 void
-alloc_cb(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
+alloc_cb(uv_handle_t *handle __attribute__((__unused__)), size_t suggested_size, uv_buf_t *buf) {
 	buf->base = malloc(suggested_size);
 	buf->len = suggested_size;
 }
 
 void
-read_data(uv_stream_t *client, ssize_t nread, const uv_buf_t *rbuf) {
-	fprintf(stderr, "%s() -> %s\n", __func__, uv_strerror(nread));
-	assert(nread > 0);
+write_prompt(uv_stream_t *stream, state_t *state);
 
-	state_t *state = uv_handle_get_data(client);
-	uint8_t *plaintext = malloc(rbuf->len - crypto_secretstream_xchacha20poly1305_ABYTES);
+void
+on_write_data(uv_write_t *req, int status) {
+	assert(status == 0);
+
+	write_t *write = uv_req_get_data(req);
+	write_free(write);
+}
+
+void
+write_data(uv_stream_t *stream, const uv_buf_t *buf) {
+	state_t *state = uv_handle_get_data(stream);
+	unsigned long long clen = buf->len + crypto_secretstream_xchacha20poly1305_ABYTES;
+	uint8_t *c = malloc(clen);
+
+	crypto_secretstream_xchacha20poly1305_push(&state->stream.state[OUT], c, &clen, (uint8_t *)buf->base, buf->len,
+						   NULL, 0, crypto_secretstream_xchacha20poly1305_TAG_MESSAGE);
+	uv_buf_t tmp = {
+		.base = (char *)c,
+		.len = clen,
+	};
+
+	write_buf(stream, &tmp, on_write_data);
+}
+
+void
+on_tty_write(uv_write_t *req, int status) {
+	assert(status == 0);
+
+	write_t *write = uv_req_get_data(req);
+	uv_stream_t *stream = write_get_data(write);
+	state_t *state = uv_handle_get_data(stream);
+
+	write_free(write);
+
+	write_prompt(stream, state);
+}
+
+readstate_t
+read_data(uv_stream_t *stream, state_t *state, uv_buf_t *buf) {
+	uint8_t *m = malloc(buf->len - crypto_secretstream_xchacha20poly1305_ABYTES);
+	unsigned long long mlen;
 	unsigned char tag;
 
-	if (crypto_secretstream_xchacha20poly1305_pull(&state->state[0], plaintext, NULL, &tag, (uint8_t *)rbuf->base,
-						       rbuf->len, NULL, 0) != 0)
+	if (crypto_secretstream_xchacha20poly1305_pull(&state->stream.state[IN], m, &mlen, &tag, (uint8_t *)buf->base,
+						       buf->len, NULL, 0) != 0)
 	{
 		/* Invalid/incomplete/corrupted ciphertext - abort */
+		/* FIXME: Close gracefully */
 		abort();
 	}
+
+	write_t *write = write_new(stream);
+	write->wbuf[0] = (uv_buf_t){
+		.base = strdup("\r< "),
+		.len = 3,
+	};
+	write->wbuf[1] = (uv_buf_t){
+		.base = (char *)m,
+		.len = mlen,
+	};
+
+	int r = uv_write(&write->req, (uv_stream_t *)&state->tty[OUT], write->wbuf, 2, on_tty_write);
+	assert(r == 0);
 
 	switch (tag) {
 	case crypto_secretstream_xchacha20poly1305_TAG_MESSAGE:
 		/* Ordinary message, continue reading */
-		break;
+		return READ_DATA;
 	case crypto_secretstream_xchacha20poly1305_TAG_FINAL:
 		/* End of the message, shutdown the stream */
-		uv_read_stop(client);
-		break;
+		return READ_DONE;
 	default:
 		abort();
 	}
 }
 
 void
-tty_write_cb(uv_write_t *req, int status) {
-	free(req);
+tty_read_cb(uv_stream_t *tty, ssize_t nread, const uv_buf_t *buf) {
+	uv_stream_t *stream = uv_handle_get_data(tty);
+	state_t *state = uv_handle_get_data(stream);
+
+	if (nread < 0) {
+		if (buf->base != NULL) {
+			free(buf->base);
+		}
+
+		state_close(stream, state);
+
+		return;
+	}
+
+	int r = uv_read_stop(tty);
+	assert(r == 0);
+
+	uv_buf_t tmp = {
+		.base = buf->base,
+		.len = nread,
+	};
+
+	write_data(stream, &tmp);
+
+	free(buf->base);
+
+	write_prompt(stream, state);
 }
 
 void
-tty_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *rbuf) {
-	uv_buf_t wbuf[3];
-
-	assert(nread > 0);
-
-	wbuf[0].base = strdup("Read: '");
-	wbuf[0].len = 7;
-	wbuf[1].base = rbuf->base;
-	wbuf[1].len = rbuf->len;
-	wbuf[2].base = strdup("'\n");
-	wbuf[2].len = 2;
-
-	int r = uv_try_write(stream, wbuf, 2);
-	assert(r == 7 + rbuf->len + 2);
-
-	free(rbuf->base);
-}
-
-void
-write_header_done(uv_write_t *req, int status) {
+on_write_prompt(uv_write_t *req, int status) {
 	assert(status == 0);
 
-	uv_tty_t tty_in;
+	write_t *write = uv_req_get_data(req);
+	uv_stream_t *stream = write_get_data(write);
+	state_t *state = uv_handle_get_data(stream);
+
+	if (!uv_is_active((uv_handle_t *)&state->tty[IN])) {
+		/* Prompt written, start reading from tty */
+		int r = uv_read_start((uv_stream_t *)&state->tty[IN], alloc_cb, tty_read_cb);
+		assert(r == 0);
+	}
+
+	write_free(write);
+}
+
+void
+write_prompt(uv_stream_t *stream, state_t *state) {
+	write_t *write = write_new(stream);
+	write->wbuf[0] = (uv_buf_t){
+		.base = strdup("> "),
+		.len = 2,
+	};
+
+	int r = uv_write(&write->req, (uv_stream_t *)&state->tty[OUT], write->wbuf, 1, on_write_prompt);
+	assert(r == 0);
+}
+
+void
+on_write_header(uv_write_t *req, int status) {
+	assert(status == 0);
+
+	write_t *write = uv_req_get_data(req);
+	uv_stream_t *stream = write_get_data(write);
+	state_t *state = uv_handle_get_data(stream);
 	uv_loop_t *loop = uv_default_loop();
 
-	int r = uv_tty_init(loop, &tty_in, fileno(stdin), 0);
+	/* Initialize reading from stdin */
+	int r = uv_tty_init(loop, &state->tty[IN], IN, 0);
 	assert(r == 0);
+	uv_handle_set_data(&state->tty[IN], stream);
 
-	uv_read_start((uv_stream_t *)&tty_in, alloc_cb, tty_read_cb);
+	r = uv_tty_init(loop, &state->tty[OUT], OUT, 0);
 	assert(r == 0);
+	uv_handle_set_data(&state->tty[OUT], stream);
 
-	uv_sleep(1000);
+	state->tty_initialized = true;
 
-	/* Can start writing data now */
+	write_prompt(stream, state);
 
 	free(req);
 }
@@ -220,24 +336,23 @@ write_header(uv_stream_t *stream) {
 	state_t *state = uv_handle_get_data(stream);
 
 	uv_buf_t buf = {
-		.base = (char *)state->header[OUT],
-		.len = sizeof(state->header[OUT]),
+		.base = (char *)state->stream.header[OUT],
+		.len = sizeof(state->stream.header[OUT]),
 	};
 
-	uv_write_t *req = malloc(sizeof(*req));
-	uv_req_set_data(req, stream);
-	int r = uv_write(req, stream, &buf, 1, write_header_done);
-	assert(r == 0);
+	write_buf(stream, &buf, on_write_header);
 }
 
 readstate_t
 read_header(state_t *state, uv_buf_t *buf) {
 	assert(buf->len == crypto_secretstream_xchacha20poly1305_HEADERBYTES);
 
-	memmove(state->header[IN], buf->base, crypto_secretstream_xchacha20poly1305_HEADERBYTES);
+	memmove(state->stream.header[IN], buf->base, crypto_secretstream_xchacha20poly1305_HEADERBYTES);
 
 	/* Decrypt the stream: initializes the state, using the key and a header */
-	if (crypto_secretstream_xchacha20poly1305_init_pull(&state->state[IN], state->header[IN], state->key) != 0) {
+	if (crypto_secretstream_xchacha20poly1305_init_pull(&state->stream.state[IN], state->stream.header[IN],
+							    state->stream.key) != 0)
+	{
 		/* FIXME: Close the stream gracefully */
 		abort();
 	}
@@ -246,7 +361,7 @@ read_header(state_t *state, uv_buf_t *buf) {
 }
 
 void
-write_pub_done(uv_write_t *req, int status) {
+on_write_pub(uv_write_t *req, int status) {
 	assert(status == 0);
 
 	write_t *write = uv_req_get_data(req);
@@ -261,11 +376,11 @@ write_pub(uv_stream_t *stream) {
 
 	buf.base = mpz_export(NULL, &buf.len, 1, sizeof(uint8_t), 1, 0, state->public);
 
-	write_buf(stream, &buf, write_pub_done);
+	write_buf(stream, &buf, on_write_pub);
 }
 
 void
-write_g_done(uv_write_t *req, int status) {
+on_write_g(uv_write_t *req, int status) {
 	assert(status == 0);
 
 	write_t *write = uv_req_get_data(req);
@@ -283,11 +398,11 @@ write_g(uv_stream_t *stream) {
 
 	buf.base = mpz_export(NULL, &buf.len, 1, sizeof(uint8_t), 1, 0, state->g);
 
-	write_buf(stream, &buf, write_g_done);
+	write_buf(stream, &buf, on_write_g);
 }
 
 void
-write_p_done(uv_write_t *req, int status) {
+on_write_p(uv_write_t *req, int status) {
 	assert(status == 0);
 
 	write_t *write = uv_req_get_data(req);
@@ -305,7 +420,7 @@ write_p(uv_stream_t *stream) {
 
 	buf.base = mpz_export(NULL, &buf.len, 1, sizeof(uint8_t), 1, 0, state->p);
 
-	write_buf(stream, &buf, write_p_done);
+	write_buf(stream, &buf, on_write_p);
 }
 
 void
@@ -315,10 +430,11 @@ compute_key(state_t *state) {
 	uv_buf_t keybuf;
 	keybuf.base = mpz_export(NULL, &keybuf.len, 1, sizeof(uint8_t), 1, 0, state->secret);
 
+	crypto_generichash(state->stream.key, sizeof(state->stream.key), (uint8_t *)keybuf.base, keybuf.len, NULL, 0);
+
 	printf("Hashed XChaCha20-Poly1309 key is ");
-	crypto_generichash(state->key, sizeof(state->key), (uint8_t *)keybuf.base, keybuf.len, NULL, 0);
-	for (size_t i = 0; i < sizeof(state->key); i++) {
-		printf("%x", state->key[i]);
+	for (size_t i = 0; i < sizeof(state->stream.key); i++) {
+		printf("%x", state->stream.key[i]);
 	}
 	printf("\n");
 }
@@ -326,17 +442,19 @@ compute_key(state_t *state) {
 void
 compute_header(state_t *state) {
 	/* Now header for XChaCha20-Poly1309 */
-	crypto_secretstream_xchacha20poly1305_init_push(&state->state[OUT], state->header[OUT], state->key);
-	printf("XChaCha20-Poly1309 header is ");
-	for (size_t i = 0; i < sizeof(state->header[OUT]); i++) {
-		printf("%x", state->header[OUT][i]);
-	}
-	printf("\n");
+	crypto_secretstream_xchacha20poly1305_init_push(&state->stream.state[OUT], state->stream.header[OUT],
+							state->stream.key);
+	/* printf("XChaCha20-Poly1309 header is "); */
+	/* for (size_t i = 0; i < sizeof(state->stream.header[OUT]); i++) { */
+	/* 	printf("%x", state->stream.header[OUT][i]); */
+	/* } */
+	/* printf("\n"); */
 
-	for (size_t i = 0; i < sizeof(state->key); i++) {
-		printf("%x", state->key[i]);
-	}
-	printf("\n");
+	/* printf("XChaCha20-Poly1309 key is "); */
+	/* for (size_t i = 0; i < sizeof(state->stream.key); i++) { */
+	/* 	printf("%x", state->stream.key[i]); */
+	/* } */
+	/* printf("\n"); */
 }
 
 readstate_t
@@ -387,7 +505,6 @@ read_buf(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 	state_t *state = uv_handle_get_data(stream);
 
 	if (nread < 0) {
-		fprintf(stderr, "%s() -> %s\n", __func__, uv_strerror(nread));
 		if (buf->base != NULL) {
 			free(buf->base);
 		}
@@ -398,26 +515,24 @@ read_buf(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
 		return;
 	}
 
-	assert(state->readlen + nread < sizeof(state->read));
+	assert(state->readlen + nread < sizeof(state->read_s.buffer));
 
 	/* Copy received data into own internal buffer */
-	memmove(&state->read.data[state->readlen], buf->base, nread);
+	memmove(&state->read_s.buffer[state->readlen], buf->base, nread);
 	state->readlen += nread;
 
-	if (buf->len > 0 && buf->base != NULL) {
-		free(buf->base);
-	}
+	free(buf->base);
 
 again:
 	/* Not enough data for a header length */
-	if (state->readlen < sizeof(state->read.len)) {
+	if (state->readlen < sizeof(state->read_s.len)) {
 		/* continue reading */
 		return;
 	}
 
 	uv_buf_t rbuf = {
-		.base = state->read.base,
-		.len = ntohll(state->read.len),
+		.base = state->read_s.base,
+		.len = ntohll(state->read_s.len),
 	};
 
 	size_t consumed = rbuf.len + sizeof(rbuf.len);
@@ -444,6 +559,7 @@ again:
 		state->rstate = read_pub(state, &rbuf);
 
 		/* Now we have p, g and other party's public key */
+		compute_key(state);
 		compute_header(state);
 
 		/* Write the stream cipher header */
@@ -453,7 +569,7 @@ again:
 		state->rstate = read_header(state, &rbuf);
 		break;
 	case READ_DATA:
-		state->rstate = read_header(state, &rbuf);
+		state->rstate = read_data(stream, state, &rbuf);
 		break;
 	default:
 		abort();
@@ -462,7 +578,7 @@ again:
 	/* Move the consumed data in the buffer */
 	size_t newlen = state->readlen - consumed;
 	if (newlen > 0) {
-		memmove(state->read.data, &rbuf.base[rbuf.len], newlen);
+		memmove(state->read_s.buffer, state->read_s.buffer + consumed, newlen);
 	}
 	state->readlen -= consumed;
 
@@ -474,10 +590,10 @@ void
 on_new_connection(uv_stream_t *server, int status) {
 	assert(status == 0);
 
-	state_t *state = uv_handle_get_data(server);
+	state_t *sstate = uv_handle_get_data(server);
 	uv_tcp_t *client = malloc(sizeof(*client));
 	uv_loop_t *loop = uv_default_loop();
-	state_t *rstate = malloc(sizeof(*rstate));
+	state_t *cstate = state_new();
 
 	int r = uv_tcp_init(loop, client);
 	assert(r == 0);
@@ -485,10 +601,21 @@ on_new_connection(uv_stream_t *server, int status) {
 	r = uv_accept(server, (uv_stream_t *)client);
 	assert(r == 0);
 
-	*rstate = *state;
-	rstate->rstate = READ_PUB;
+	/* Copy p and g from server state */
+	mpz_set(cstate->p, sstate->p);
+	mpz_set(cstate->g, sstate->g);
 
-	uv_handle_set_data(client, rstate);
+	/* Choose a secret integer for the private key in <1, p-1> range */
+	mpz_urandomm1(cstate->private, randstate, cstate->p);
+	gmp_printf("Server private key is %Zd\n", cstate->private);
+
+	/* Calculate the public key */
+	mpz_powm(cstate->public, cstate->g, cstate->private, cstate->p);
+	gmp_printf("Server public key  is %Zd\n", cstate->public);
+
+	cstate->rstate = READ_PUB;
+
+	uv_handle_set_data(client, cstate);
 
 	write_p((uv_stream_t *)client);
 
@@ -538,7 +665,7 @@ gen_safe_prime(mpz_t rop, mp_bitcnt_t n) {
 }
 
 void
-usage(int argc, char **argv) {
+usage(int argc __attribute__((__unused__)), char **argv) {
 	fprintf(stderr, "usage: %s [--client|--server] [--modulus <prime>] [--base <prime root>]\n", argv[0]);
 	exit(1);
 }
@@ -561,14 +688,6 @@ server(state_t *state) {
 	gmp_printf("Server modulus (p) is %Zd\n", state->p);
 	gmp_printf("Server base (g)    is %Zd\n", state->g);
 
-	/* Choose a secret integer for the private key in <1, p-1> range */
-	mpz_urandomm1(state->private, randstate, state->p);
-	gmp_printf("Server private key is %Zd\n", state->private);
-
-	/* Calculate the public key */
-	mpz_powm(state->public, state->g, state->private, state->p);
-	gmp_printf("Server public key  is %Zd\n", state->public);
-
 	uv_tcp_t tcp;
 	uv_loop_t *loop = uv_default_loop();
 
@@ -589,10 +708,6 @@ server(state_t *state) {
 	assert(r == 0);
 
 	uv_loop_close(loop);
-
-	/* Initialize asynchronous stdout */
-	/* r = uv_tty_init(loop, &tty_out, fileno(stdout), 0); */
-	/* assert(r == 0); */
 
 	return 0;
 }
@@ -632,11 +747,13 @@ client(state_t *state) {
 
 	r = uv_run(loop, UV_RUN_DEFAULT);
 
+	uv_loop_close(loop);
+
 	return 0;
 }
 
 void
-init(state_t *state) {
+init(void) {
 	/* Initialize global randomstate */
 	unsigned int randseed;
 	int r = uv_random(NULL, NULL, &randseed, sizeof(randseed), 0, NULL);
@@ -647,26 +764,23 @@ init(state_t *state) {
 	if (sodium_init() == -1) {
 		abort();
 	}
-
-	mpz_inits(state->p, state->g, state->private, state->public, state->secret, NULL);
 }
 
 void
-cleanup(state_t *state) {
+cleanup(void) {
 	/* Cleanup randstate */
 	gmp_randclear(randstate);
-	mpz_clears(state->p, state->g, state->private, state->public, state->secret, NULL);
 }
 
 /* C program to demonstrate the Diffie-Hellman algorithm */
 int
 main(int argc, char **argv) {
 	op_mode_t op_mode = no_mode;
-	state_t state = { 0 };
+	state_t *state = state_new();
 	int rv = 0;
 	int ch;
 
-	init(&state);
+	init();
 
 	static struct option longopts[] = {
 		{ "client", no_argument, NULL, 'c' },
@@ -696,7 +810,7 @@ main(int argc, char **argv) {
 			op_mode = server_mode;
 			break;
 		case 'p':
-			if (mpz_set_str(state.p, optarg, 10) == -1) {
+			if (mpz_set_str(state->p, optarg, 10) == -1) {
 				fprintf(stderr, "Invalid modulus: %s\n", optarg);
 				rv = 1;
 				goto out;
@@ -704,7 +818,7 @@ main(int argc, char **argv) {
 			have_p = true;
 			break;
 		case 'g':
-			if (mpz_set_str(state.g, optarg, 10) == -1) {
+			if (mpz_set_str(state->g, optarg, 10) == -1) {
 				fprintf(stderr, "Invalid base: %s\n", optarg);
 				rv = 1;
 				goto out;
@@ -721,7 +835,7 @@ main(int argc, char **argv) {
 	/* FIXME: Get address and port from the command line */
 
 	/* Initialize the server (and) client sockaddr */
-	uv_ip6_addr("::1", 12345, (struct sockaddr_in6 *)&state.addr);
+	uv_ip6_addr("::1", 12345, (struct sockaddr_in6 *)&state->addr);
 
 	if ((have_p && !have_g) || (!have_p && have_g)) {
 		fprintf(stderr, "You either need to set both p and g or none!\n");
@@ -733,22 +847,22 @@ main(int argc, char **argv) {
 	case server_mode:
 		/* Generate our p and g */
 		if (!have_p && !have_g) {
-			int r = gen_safe_prime(state.p, PRIME_BITS);
+			int r = gen_safe_prime(state->p, PRIME_BITS);
 			assert(r > 0);
 		}
 		/* Generator can be 2 for any safe prime */
-		mpz_init_set_ui(state.g, 2);
+		mpz_init_set_ui(state->g, 2);
 
-		rv = server(&state);
+		rv = server(state);
 		break;
 	case client_mode:
-		rv = client(&state);
+		rv = client(state);
 		break;
 	default:
 		abort();
 	}
 
-	cleanup(&state);
 out:
+	cleanup();
 	return rv;
 }

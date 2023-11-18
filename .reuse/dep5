@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Diffie-Hellman-Merkle
+Upstream-Contact: Ondřej Surý <ondrej@sury.org>
+Source: https://github.com/oerdnj/XKOSB-3
+
+Files: .clang-format
+       .gitignore
+       README.md
+       meson.build
+Copyright: Ondřej Surý
+License: WTFPL

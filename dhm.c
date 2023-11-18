@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: Ondřej Surý
+ *
+ * SPDX-License-Identifier: WTFPL
+ */
+
 #include <assert.h>
 #include <getopt.h>
 #include <gmp.h>

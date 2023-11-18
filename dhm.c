@@ -102,7 +102,15 @@ state_close_cb(uv_handle_t *handle) {
 
 void
 state_close(uv_stream_t *stream, state_t *state) {
-	/* This need to be in reverse order */
+	/*
+	 * TODO: Send the final tag to other party instead of just
+	 * closing connection
+	 */
+
+	/*
+	 * This need to be in reverse order as the uv_loop queue is processed in
+	 * reverse.
+	 */
 	uv_close(stream, state_close_cb);
 	if (state->tty_initialized) {
 		uv_close(&state->tty[1], NULL);
@@ -432,6 +440,8 @@ compute_key(state_t *state) {
 
 	crypto_generichash(state->stream.key, sizeof(state->stream.key), (uint8_t *)keybuf.base, keybuf.len, NULL, 0);
 
+	free(keybuf.base);
+
 	printf("Hashed XChaCha20-Poly1309 key is ");
 	for (size_t i = 0; i < sizeof(state->stream.key); i++) {
 		printf("%x", state->stream.key[i]);
@@ -444,17 +454,6 @@ compute_header(state_t *state) {
 	/* Now header for XChaCha20-Poly1309 */
 	crypto_secretstream_xchacha20poly1305_init_push(&state->stream.state[OUT], state->stream.header[OUT],
 							state->stream.key);
-	/* printf("XChaCha20-Poly1309 header is "); */
-	/* for (size_t i = 0; i < sizeof(state->stream.header[OUT]); i++) { */
-	/* 	printf("%x", state->stream.header[OUT][i]); */
-	/* } */
-	/* printf("\n"); */
-
-	/* printf("XChaCha20-Poly1309 key is "); */
-	/* for (size_t i = 0; i < sizeof(state->stream.key); i++) { */
-	/* 	printf("%x", state->stream.key[i]); */
-	/* } */
-	/* printf("\n"); */
 }
 
 readstate_t
@@ -666,7 +665,8 @@ gen_safe_prime(mpz_t rop, mp_bitcnt_t n) {
 
 void
 usage(int argc __attribute__((__unused__)), char **argv) {
-	fprintf(stderr, "usage: %s [--client|--server] [--modulus <prime>] [--base <prime root>]\n", argv[0]);
+	fprintf(stderr, "usage: %s [--client|--server] [--modulus <prime>] [--base <prime root>] <address> <port>\n",
+		argv[0]);
 	exit(1);
 }
 
@@ -832,10 +832,17 @@ main(int argc, char **argv) {
 	argc -= optind;
 	argv += optind;
 
-	/* FIXME: Get address and port from the command line */
+	if (argc != 2) {
+		argc += optind;
+		argv -= optind;
+		usage(argc, argv);
+	}
+
+	char *ip = argv[0];
+	int port = atoi(argv[1]);
 
 	/* Initialize the server (and) client sockaddr */
-	uv_ip6_addr("::1", 12345, (struct sockaddr_in6 *)&state->addr);
+	uv_ip6_addr(ip, port, (struct sockaddr_in6 *)&state->addr);
 
 	if ((have_p && !have_g) || (!have_p && have_g)) {
 		fprintf(stderr, "You either need to set both p and g or none!\n");

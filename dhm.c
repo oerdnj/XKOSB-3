@@ -20,7 +20,7 @@
 #define IN  0
 #define OUT 1
 
-#define PRIME_BITS	   128
+#define DEFAULT_PRIME_BITS 512
 #define PROBAB_PRIME_ITERS 50
 
 #if __linux__
@@ -671,7 +671,9 @@ gen_safe_prime(mpz_t rop, mp_bitcnt_t n) {
 
 void
 usage(int argc __attribute__((__unused__)), char **argv) {
-	fprintf(stderr, "usage: %s [--client|--server] [--modulus <prime>] [--base <prime root>] <address> <port>\n",
+	fprintf(stderr,
+		"usage: %s [--client|--server] [--bits <bits>] [--modulus <prime>] [--base <prime root>] <address> "
+		"<port>\n",
 		argv[0]);
 	exit(1);
 }
@@ -785,23 +787,31 @@ main(int argc, char **argv) {
 	state_t *state = state_new();
 	int rv = 0;
 	int ch;
+	int prime_bits = DEFAULT_PRIME_BITS;
 
 	init();
 
 	static struct option longopts[] = {
-		{ "client", no_argument, NULL, 'c' },
-		{ "server", no_argument, NULL, 's' },
-		{ "modulus", required_argument, NULL, 'p' },
+		{ "bits", required_argument, NULL, 'b' }, { "client", no_argument, NULL, 'c' },
+		{ "server", no_argument, NULL, 's' },	  { "modulus", required_argument, NULL, 'p' },
 		{ "base", required_argument, NULL, 'g' },
 	};
 
 	bool have_p = false;
 	bool have_g = false;
-	while ((ch = getopt_long(argc, argv, "csp:g:", longopts, NULL)) != -1) {
+	while ((ch = getopt_long(argc, argv, "b:csp:g:", longopts, NULL)) != -1) {
 		switch (ch) {
+		case 'b':
+			prime_bits = atoi(optarg);
+			if (prime_bits < 3) {
+				fprintf(stderr, "ERROR: Prime bits must be at least 3 bits\n");
+				rv = 1;
+				goto out;
+			}
+			break;
 		case 'c':
 			if (op_mode == server_mode) {
-				fprintf(stderr, "You cannot specify both client and server\n");
+				fprintf(stderr, "ERROR: You cannot specify both client and server\n");
 				rv = 1;
 				goto out;
 			}
@@ -809,7 +819,7 @@ main(int argc, char **argv) {
 			break;
 		case 's':
 			if (op_mode == client_mode) {
-				fprintf(stderr, "You cannot specify both client and server\n");
+				fprintf(stderr, "ERROR: You cannot specify both client and server\n");
 				rv = 1;
 				goto out;
 			}
@@ -817,7 +827,7 @@ main(int argc, char **argv) {
 			break;
 		case 'p':
 			if (mpz_set_str(state->p, optarg, 10) == -1) {
-				fprintf(stderr, "Invalid modulus: %s\n", optarg);
+				fprintf(stderr, "ERROR: Invalid modulus: %s\n", optarg);
 				rv = 1;
 				goto out;
 			}
@@ -825,7 +835,7 @@ main(int argc, char **argv) {
 			break;
 		case 'g':
 			if (mpz_set_str(state->g, optarg, 10) == -1) {
-				fprintf(stderr, "Invalid base: %s\n", optarg);
+				fprintf(stderr, "ERROR: Invalid base: %s\n", optarg);
 				rv = 1;
 				goto out;
 			}
@@ -839,6 +849,7 @@ main(int argc, char **argv) {
 	argv += optind;
 
 	if (argc != 2) {
+		fprintf(stderr, "ERROR: Missing IP address and port\n");
 		argc += optind;
 		argv -= optind;
 		usage(argc, argv);
@@ -860,7 +871,7 @@ main(int argc, char **argv) {
 	case server_mode:
 		/* Generate our p and g */
 		if (!have_p && !have_g) {
-			int r = gen_safe_prime(state->p, PRIME_BITS);
+			int r = gen_safe_prime(state->p, prime_bits);
 			assert(r > 0);
 		}
 		/* Generator can be 2 for any safe prime */

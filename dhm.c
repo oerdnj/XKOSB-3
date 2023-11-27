@@ -669,7 +669,7 @@ gen_safe_prime(mpz_t rop, mp_bitcnt_t n) {
 	return r;
 }
 
-void
+__attribute__((__noreturn__)) void
 usage(int argc __attribute__((__unused__)), char **argv) {
 	fprintf(stderr,
 		"usage: %s [--client|--server] [--bits <bits>] [--modulus <prime>] [--base <prime root>] <address> "
@@ -794,13 +794,16 @@ main(int argc, char **argv) {
 	static struct option longopts[] = {
 		{ "bits", required_argument, NULL, 'b' }, { "client", no_argument, NULL, 'c' },
 		{ "server", no_argument, NULL, 's' },	  { "modulus", required_argument, NULL, 'p' },
-		{ "base", required_argument, NULL, 'g' },
+		{ "base", required_argument, NULL, 'g' }, { "help", no_argument, NULL, 'h' },
 	};
 
 	bool have_p = false;
 	bool have_g = false;
-	while ((ch = getopt_long(argc, argv, "b:csp:g:", longopts, NULL)) != -1) {
+	while ((ch = getopt_long(argc, argv, "b:csp:g:h", longopts, NULL)) != -1) {
 		switch (ch) {
+		case 'h':
+			usage(argc, argv);
+			break;
 		case 'b':
 			prime_bits = atoi(optarg);
 			if (prime_bits < 3) {

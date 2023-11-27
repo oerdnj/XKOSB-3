@@ -470,7 +470,7 @@ read_pub(state_t *state, uv_buf_t *buf) {
 	mpz_import(other_public, buf->len, 1, sizeof(uint8_t), 1, 0, buf->base);
 	gmp_printf("Other public key   is %Zd\n", other_public);
 
-	mpz_powm(state->secret, other_public, state->private, state->p);
+	mpz_powm_sec(state->secret, other_public, state->private, state->p);
 	gmp_printf("Computed secret key is %Zd\n", state->secret);
 
 	mpz_clear(other_public);
@@ -485,7 +485,7 @@ compute_pub(state_t *state) {
 	gmp_printf("Client private key is %Zd\n", state->private);
 
 	/* Calculate client public key */
-	mpz_powm(state->public, state->g, state->private, state->p);
+	mpz_powm_sec(state->public, state->g, state->private, state->p);
 	gmp_printf("Client public key  is %Zd\n", state->public);
 }
 
@@ -615,7 +615,7 @@ on_new_connection(uv_stream_t *server, int status) {
 	gmp_printf("Server private key is %Zd\n", cstate->private);
 
 	/* Calculate the public key */
-	mpz_powm(cstate->public, cstate->g, cstate->private, cstate->p);
+	mpz_powm_sec(cstate->public, cstate->g, cstate->private, cstate->p);
 	gmp_printf("Server public key  is %Zd\n", cstate->public);
 
 	cstate->rstate = READ_PUB;

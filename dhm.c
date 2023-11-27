@@ -792,9 +792,13 @@ main(int argc, char **argv) {
 	init();
 
 	static struct option longopts[] = {
-		{ "bits", required_argument, NULL, 'b' }, { "client", no_argument, NULL, 'c' },
-		{ "server", no_argument, NULL, 's' },	  { "modulus", required_argument, NULL, 'p' },
-		{ "base", required_argument, NULL, 'g' }, { "help", no_argument, NULL, 'h' },
+		{ "bits", required_argument, NULL, 'b' },
+		{ "client", no_argument, NULL, 'c' },
+		{ "server", no_argument, NULL, 's' },
+		{ "modulus", required_argument, NULL, 'p' },
+		{ "base", required_argument, NULL, 'g' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
 	};
 
 	bool have_p = false;
